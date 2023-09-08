@@ -45,6 +45,7 @@ bool onImageClick(GtkWidget *widget, GdkEventButton *event, gpointer data); //Ca
 bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data); //Called when you release the image
 bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data); //Called while you are dragging the image
 void modifyImageDialog(GtkWidget *widget, gpointer data); //Called when user wants to modify the image
+void modifyButtonCreate(GtkWidget *grid, int gridPos[4], void (*func)(GtkWidget*, gpointer), gpointer data, char* name); //Creates buttons for the modifyImageDialog
 
 //Modify image functions
 void editAllPixels(GtkWidget *widget, gpointer data);
@@ -53,12 +54,16 @@ uc* invertPixel(uc* rgb, int factor);
 uc* darkenPixel(uc* rgb, int factor);
 uc* lightenPixel(uc* rgb, int factor);
 void flip(GtkWidget *widget, gpointer data);
+void flop(GtkWidget *widget, gpointer data);
+void rotateRight(GtkWidget *widget, gpointer data);
+void rotateLeft(GtkWidget *widget, gpointer data);
+void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int channels);
 
 void activate(GtkApplication *app, gpointer data) {
   GtkWidget *window = gtk_application_window_new(app);
   gtk_window_set_default_size(GTK_WINDOW(window), scrollWidth, scrollHeight);
   gtk_container_set_border_width(GTK_CONTAINER(window), 10);
-  gtk_window_set_title(GTK_WINDOW(window), "Color Swap");
+  gtk_window_set_title(GTK_WINDOW(window), "Image Modifier");
 
   //CSS provider (lets us now where the css file is)
   GtkCssProvider *cssProvider = gtk_css_provider_new();
@@ -228,18 +233,29 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { /
   double aspectR = (double)currentImageWidth/currentImageHeight;
   int add = zoomIn ? 40 : -40;
 
-
+  //Scale the image in relation to its aspect ratio
   currentPix = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth+(int)(add*aspectR), currentImageHeight+add, GDK_INTERP_NEAREST);
   gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);
 
+  //FInd out where the scroll bars are
   GtkAdjustment *vScroll = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(widget));
   GtkAdjustment *hScroll = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(widget));
+  
+  //event->y and event->x are the mouses coordinates respectively vertical and horizontal
+  /*------------------------------------------------------------------------------------
+    Imagine our mouse was the at the top left corner of the image and we were zooming in.
+    The top left corner is (0,0) for x and y.
+    If we were zooming into the top left corner we wouldn't want to adjust the scroll wheel at all.
+    When the image gets larger the scroll wheels don't change position. However, the image gets larger and it appears as though the scroll wheels went up and left.
+    So when we are adjusting we actually have to account for where the mouse is, if you imagine the opposite (bottom right corner) we want to adjust the maximum amount to keep up.
 
-  currentImageWidth += (int)(add*aspectR);
-  currentImageHeight += add;
-
+    This works fine, but it isn't perfect.
+    ------------------------------------------------------------------------------------
+  */
   double displacementV = add*(event->y/scrollHeight), displacementH = ((int)(add*aspectR))*(event->x/scrollWidth);
 
+
+  //This is done automatically after the function ends, but we set it here in the case the adjustment value needs to be there
   gtk_adjustment_set_upper(hScroll,  gtk_adjustment_get_upper(hScroll)+((int)(add*aspectR)));
   gtk_adjustment_set_upper(vScroll,  gtk_adjustment_get_upper(vScroll)+ add);
 
@@ -249,6 +265,9 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { /
 
 
   g_object_unref(currentPix);
+
+  currentImageWidth += (int)(add*aspectR);
+  currentImageHeight += add;
 
   return 1;
 } //FUNCTION END
@@ -289,11 +308,10 @@ bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Ca
 
     int adjX = xMove - event->x;
     int adjY = yMove - event->y;
-    gtk_adjustment_set_value(hAdj, gtk_adjustment_get_value(hAdj)+adjX/1.5);
-    gtk_adjustment_set_value(vAdj, gtk_adjustment_get_value(vAdj)+adjY/1.5);
 
-    xMove = event->x;
-    yMove = event->y;
+    //Moves scroll wheel based on where our original mouse position was
+    gtk_adjustment_set_value(hAdj, gtk_adjustment_get_value(hAdj)+adjX); 
+    gtk_adjustment_set_value(vAdj, gtk_adjustment_get_value(vAdj)+adjY);
   }
   return 1;
 } //FUNCTION END
@@ -306,62 +324,60 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   gtk_widget_set_size_request(dialog, 500, 500);
   gtk_window_set_title(GTK_WINDOW(dialog), "Modifier Functions");
 
-  GtkWidget *notebook = gtk_notebook_new();
-  gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), notebook);
-
-  //PAGE 1 
   GtkWidget *grid = gtk_grid_new();
-  entry = gtk_entry_new();
+
+  entry = gtk_entry_new(); //Create entry box
   gtk_widget_set_hexpand(entry, true);
-  gtk_grid_attach(GTK_GRID(grid), entry, 0, 0, 2, 1);
+  gtk_grid_attach(GTK_GRID(grid), entry, 0, 0, 1, 1);
+  GtkWidget *notebook = gtk_notebook_new(); //Create Notebook
+  gtk_grid_attach(GTK_GRID(grid), notebook, 0, 1, 1, 1);
 
-  GtkWidget *greyscaleBtn = gtk_button_new_with_label("Greyscale");
-  gtk_widget_set_hexpand(greyscaleBtn, true), gtk_widget_set_vexpand(greyscaleBtn, true);
-  gtk_grid_attach(GTK_GRID(grid), greyscaleBtn, 0, 1, 1, 1);
-  g_signal_connect(greyscaleBtn, "clicked", G_CALLBACK(editAllPixels), &((EditArgs){&greyscalePixel, -1}));
+  gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), grid);
 
-  GtkWidget *invertBtn = gtk_button_new_with_label("Invert");
-  gtk_widget_set_hexpand(invertBtn, true), gtk_widget_set_vexpand(invertBtn, true);
-  gtk_grid_attach(GTK_GRID(grid), invertBtn, 0, 2, 1, 1);
-  g_signal_connect(invertBtn, "clicked", G_CALLBACK(editAllPixels), &((EditArgs){&invertPixel, -1}));
-
-  GtkWidget *darkenBtn = gtk_button_new_with_label("Darken*");
-  gtk_widget_set_hexpand(darkenBtn, true), gtk_widget_set_vexpand(darkenBtn, true);
-  gtk_grid_attach(GTK_GRID(grid), darkenBtn, 1, 1, 1, 1);
-  g_signal_connect(darkenBtn, "clicked", G_CALLBACK(editAllPixels), &((EditArgs){&darkenPixel, 2}));
-
-  GtkWidget *lightenBtn = gtk_button_new_with_label("Lighten*");
-  gtk_widget_set_hexpand(lightenBtn, true), gtk_widget_set_vexpand(lightenBtn, true);
-  gtk_grid_attach(GTK_GRID(grid), lightenBtn, 1, 2, 1, 1);
-  g_signal_connect(lightenBtn, "clicked", G_CALLBACK(editAllPixels), &((EditArgs){&lightenPixel, 2}));
-
+  //Modifier Button order (0,0) -> (0,1) -> (1,0) -> (1,1)
+  //PAGE 1 
+  grid = gtk_grid_new();
+  modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &editAllPixels, &((EditArgs){&greyscalePixel, -1}), "Greyscale");
+  modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &editAllPixels, &((EditArgs){&invertPixel, -1}), "Invert");
+  modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &editAllPixels, &((EditArgs){&darkenPixel, 2}), "Darken*");
+  modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &editAllPixels, &((EditArgs){&lightenPixel, 2}), "Lighten*");
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Page 1"));
   //END OF PAGE 1
 
   //PAGE 2
   grid = gtk_grid_new();
-  entry = gtk_entry_new();
-  gtk_widget_set_hexpand(entry, true);
-  gtk_grid_attach(GTK_GRID(grid), entry, 0, 0, 2, 1);
-
-  GtkWidget *flipBtn = gtk_button_new_with_label("Flip");
-  gtk_widget_set_hexpand(flipBtn, true), gtk_widget_set_vexpand(flipBtn, true);
-  gtk_grid_attach(GTK_GRID(grid), flipBtn, 0, 1, 1, 1);
-  g_signal_connect(flipBtn, "clicked", G_CALLBACK(flip), NULL);
-
+  modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &flip, NULL, "Flip");
+  modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &rotateRight, NULL, "Rotate Right");
+  modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &flop, NULL, "Flop");
+  modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &rotateLeft, NULL, "Rotate Left");
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Page 2"));
   //END OF PAGE 2
+
 
   gtk_widget_show_all(dialog);
   gtk_dialog_run(GTK_DIALOG(dialog));
 
   gtk_widget_destroy(dialog);
 } //FUNCTION END
-
-
 /*
-IMAGE MODIFIER FUNCTIONS
-All image modifier functions exist below here 
+ * gird - grid the widget is part of
+ * gridPos - grid parameters as an array
+ * *func - function pointer for which function to call when the button is clicked
+ * data - extra data to pass into the function when the button is clicked
+ * name - name of the button
+ */
+void modifyButtonCreate(GtkWidget *grid, int gridPos[4], void (*func)(GtkWidget*, gpointer), gpointer data, char* name) { //Creates buttons for the modifyImageDialog
+  GtkWidget *btn = gtk_button_new_with_label(name);
+  gtk_widget_set_hexpand(btn, true), gtk_widget_set_vexpand(btn, true);
+  gtk_grid_attach(GTK_GRID(grid), btn, gridPos[0], gridPos[1], gridPos[2], gridPos[3]);
+  g_signal_connect(btn, "clicked", G_CALLBACK(func), data);
+} //FUNCTION END
+
+
+/* ---------------------------------------------
+ * IMAGE MODIFIER FUNCTIONS
+ * All image modifier functions exist below here
+ * --------------------------------------------- 
 */
 void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algorithm to all pixels in the originalImagePix
     EditArgs *args = (EditArgs *)data;
@@ -382,20 +398,17 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
       for (int j = 0; j < width; j++) {
         int offset = i * rowStride + j*channels;
         uc* rgb = malloc(3*sizeof(uc));
-        rgb[0] = pixels[offset];
-        rgb[1] = pixels[offset+1];
-        rgb[2] = pixels[offset+2];
+        editPixel(rgb, pixels, 0, offset, 3); //Edit pixel
 
         uc* newPixel = args->operation(rgb, factor);
-        pixels[offset] = newPixel[0];
-        pixels[offset+1] = newPixel[1];
-        pixels[offset+2] = newPixel[2];
+        editPixel(pixels, newPixel, offset, 0, 3); //Edit pixel
         free(rgb);
         free(newPixel);
       }
     }
     resizeImage(widget, NULL);
 } //FUNCTION END
+
 
 uc* greyscalePixel(uc* rgb, int factor) { //Greyscale a pixel
   uc* pixel = malloc(3 * sizeof(uc));
@@ -427,6 +440,7 @@ uc* lightenPixel(uc* rgb, int factor) { //Lighten a pixel
   return pixel;
 } //FUNCTION END
 
+
 void flip(GtkWidget *widget, gpointer data) { //Flip the image
   uc *pixels = gdk_pixbuf_get_pixels(originalImagePix);
   int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
@@ -435,19 +449,141 @@ void flip(GtkWidget *widget, gpointer data) { //Flip the image
   currentPix = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, width, height);
   uc *pixelsNew = gdk_pixbuf_get_pixels(currentPix);
 
+  /* (How the loop works)
+    Imagine an image like this
+
+    ----
+    ----
+    &*** (We loop through this row first from 0 to n rightward and then go up a row)
+
+    - represent image pixels
+    * represent pixels we are looping through
+    & represents the pixel we start at when looping
+  */
   for (int i = height-1; i >= 0; i--) {
     for (int j = 0; j < width; j++) {
       int offsetNew = ((height-1-i)*rowstride) + j*channels, offset = i*rowstride + j*channels;
-      pixelsNew[offsetNew] = pixels[offset];
-      pixelsNew[offsetNew + 1] = pixels[offset + 1];
-      pixelsNew[offsetNew + 2] = pixels[offset + 2];
-      if (channels == 4) pixelsNew[offsetNew + 3] = pixels[offset + 3];
+      editPixel(pixelsNew, pixels, offsetNew, offset, channels); //Edit pixel
     }
   }
   g_object_unref(originalImagePix);
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
+} //FUNCTION END
+
+
+void flop(GtkWidget *widget, gpointer data) { //Flop the image
+  uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
+  int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
+  int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
+
+  currentPix = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, width, height);
+  uc* pixelsNew = gdk_pixbuf_get_pixels(currentPix);
+  /* (How the loop works)
+    Imagine an image like this
+
+    ---& (We loop through this column first from 0 to n downward and then go left a column)
+    ---*
+    ---* 
+
+    - represent image pixels
+    * represent pixels we are looping through
+    & represents the pixel we start at when looping
+  */
+  for (int i = width - 1; i >= 0; i--) {
+    for (int j = 0; j < height; j++) {
+      int offsetNew = j*rowstride + (width-1-i)*channels, offset = j*rowstride + i*channels;
+      editPixel(pixelsNew, pixels, offsetNew, offset, channels); //Edit Pixel
+    }
+  }
+  g_object_unref(originalImagePix);
+  originalImagePix = gdk_pixbuf_copy(currentPix);
+  g_object_unref(currentPix);
+  resizeImage(widget, NULL);
+} //FUNCTION END
+
+
+void rotateRight(GtkWidget *widget, gpointer data) { //Rotate an image right
+  uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
+  int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
+  int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
+
+  currentPix = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, height, width);
+  int rowstrideNew = gdk_pixbuf_get_rowstride(currentPix);
+  uc* pixelsNew = gdk_pixbuf_get_pixels(currentPix); 
+  
+  /* (How the loop works)
+    Imagine an image like this
+
+    &****                                            ----&
+    -----                                            ----*
+    ----- (Then we transfer the pixels like this) -> ----*
+    -----                                            ----*
+    -----                                            ----*
+
+    - represent image pixels
+    * represent pixels we are looping through
+    & represents the pixel we start at when looping
+  */
+  for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+      //Keep in mind for the currentPix the width and height have swapped
+      int offsetNew = j*rowstrideNew + (height-1-i)*channels, offset = i*rowstride + j*channels;
+      editPixel(pixelsNew, pixels, offsetNew, offset, channels); //Edit Pixel
+    }
+  }
+  g_object_unref(originalImagePix);
+  originalImagePix = gdk_pixbuf_copy(currentPix);
+  g_object_unref(currentPix);
+  resizeImage(widget, NULL);
+} //FUNCTION END
+
+
+void rotateLeft(GtkWidget *widget, gpointer data) { //Rotates an image left
+  uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
+  int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
+  int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
+
+  currentPix = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, height, width);
+  int rowstrideNew = gdk_pixbuf_get_rowstride(currentPix);
+  uc* pixelsNew = gdk_pixbuf_get_pixels(currentPix);
+  /* (How the loop works)
+    Imagine an image like this
+
+    &****                                            *----
+    -----                                            *----
+    ----- (Then we transfer the pixels like this) -> *----
+    -----                                            *----
+    -----                                            &----
+
+    - represent image pixels
+    * represent pixels we are looping through
+    & represents the pixel we start at when looping
+  */
+  for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+      //Keep in mind for the currentPix the width and height have swapped
+      int offsetNew = (width-1-j)*rowstrideNew+i*channels, offset = i*rowstride + j*channels;
+      editPixel(pixelsNew, pixels, offsetNew, offset, channels); //Edit Pixel
+    }
+  }
+  g_object_unref(originalImagePix);
+  originalImagePix = gdk_pixbuf_copy(currentPix);
+  g_object_unref(currentPix);
+  resizeImage(widget, NULL);
+} //FUNCTION END
+
+
+void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int channels) { //Used to set a pixel
+  for (int i = 0; i < channels; i++) pixelsNew[offsetNew+i] = pixelsOld[offsetOld+i];
+  /* The for loop above is equivalent to doing this
+  
+    pixelsNew[offsetNew] = pixelsOld[offsetOld];
+    pixelsNew[offsetNew + 1] = pixelsOld[offsetOld + 1];
+    pixelsNew[offsetNew + 2] = pixelsOld[offsetOld + 2];
+    if (channels == 4) pixelsNew[offsetNew + 3] = pixelsOld[offsetOld + 3];
+  */
 } //FUNCTION END
 
 
