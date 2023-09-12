@@ -39,6 +39,7 @@ int xMove, yMove;
 void windowResized(GtkWidget *widget, GdkRectangle *allocation, gpointer data); //Call when the window is resized
 void resizeImage(GtkWidget *widget, gpointer data); //Call when the window is resized
 void chooseFile(GtkWidget *widget, gpointer data); //Function to choose a file
+void saveFile(GtkWidget *widget, gpointer data); //Function to save a file
 void defineCSS(GtkWidget *widget, GtkCssProvider *cssProvider, char* class); //Function used to define css for widgets
 bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data); //Used to resize the image on scroll
 bool onImageClick(GtkWidget *widget, GdkEventButton *event, gpointer data); //Called when you click the image
@@ -46,6 +47,7 @@ bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data); //
 bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data); //Called while you are dragging the image
 void modifyImageDialog(GtkWidget *widget, gpointer data); //Called when user wants to modify the image
 void modifyButtonCreate(GtkWidget *grid, int gridPos[4], void (*func)(GtkWidget*, gpointer), gpointer data, char* name); //Creates buttons for the modifyImageDialog
+void cropImage(GtkWidget *widget, gpointer data); //Crop the image
 
 //Modify image functions
 void editAllPixels(GtkWidget *widget, gpointer data);
@@ -58,6 +60,7 @@ void flop(GtkWidget *widget, gpointer data);
 void rotateRight(GtkWidget *widget, gpointer data);
 void rotateLeft(GtkWidget *widget, gpointer data);
 void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int channels);
+
 
 void activate(GtkApplication *app, gpointer data) {
   GtkWidget *window = gtk_application_window_new(app);
@@ -89,9 +92,15 @@ void activate(GtkApplication *app, gpointer data) {
   //Image styles
   GtkWidget *modifyBtn = gtk_button_new_with_label("Modify");
   gtk_box_pack_start(GTK_BOX(hbox), modifyBtn, FALSE, FALSE, 0);
+  //Crop Button
+  GtkWidget *cropBtn = gtk_button_new_with_label("Crop");
+  gtk_box_pack_start(GTK_BOX(hbox), cropBtn, FALSE, FALSE, 0);
   //Aspect Ratio Check
   keepAspectRatio = gtk_check_button_new_with_label("Keep Aspect Ratio");
   gtk_box_pack_start(GTK_BOX(hbox), keepAspectRatio, FALSE, FALSE, 0);
+  //Save Button
+  GtkWidget *saveBtn = gtk_button_new_with_label("Save");
+  gtk_box_pack_start(GTK_BOX(hbox), saveBtn, FALSE, FALSE, 0);
 
   //Create the scroll window
   GtkWidget *scrollBox = gtk_scrolled_window_new(NULL, NULL);
@@ -105,7 +114,8 @@ void activate(GtkApplication *app, gpointer data) {
   gtk_container_add(GTK_CONTAINER(eventBox), image);
 
   //Signal events
-  g_signal_connect(fileChooser, "clicked", G_CALLBACK(chooseFile), image);
+  g_signal_connect(fileChooser, "clicked", G_CALLBACK(chooseFile), NULL);
+  g_signal_connect(saveBtn, "clicked", G_CALLBACK(saveFile), NULL);
   g_signal_connect(resizeBtn, "clicked", G_CALLBACK(resizeImage), NULL);
   g_signal_connect(window, "size-allocate", G_CALLBACK(windowResized), scrollBox);
   g_signal_connect(scrollBox, "scroll-event", G_CALLBACK(scrolledResize), NULL);
@@ -113,6 +123,7 @@ void activate(GtkApplication *app, gpointer data) {
   g_signal_connect(eventBox, "button-release-event", G_CALLBACK(onImageRelease), NULL);
   g_signal_connect(scrollBox, "motion-notify-event", G_CALLBACK(onImageMove), NULL);
   g_signal_connect(modifyBtn, "clicked", G_CALLBACK(modifyImageDialog), NULL);
+  g_signal_connect(cropBtn, "clicked", G_CALLBACK(cropImage), scrollBox);
   
 
 
@@ -145,7 +156,6 @@ void defineCSS(GtkWidget *widget, GtkCssProvider *cssProvider, char* class) { //
 } //FUNCTION END
 
 void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose file button is clicked
-  GtkWidget *image = data;
 
   GtkFileChooser *chooser = GTK_FILE_CHOOSER(gtk_file_chooser_dialog_new("Open File", GTK_WINDOW(gtk_widget_get_toplevel(image)),GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel", GTK_RESPONSE_CANCEL,"_Open", GTK_RESPONSE_ACCEPT, NULL));
   int res = gtk_dialog_run(GTK_DIALOG(chooser));
@@ -161,56 +171,53 @@ void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose fil
     //If it wasn't an image then break the program lol
     if (originalImagePix == NULL) exit(1);
 
-    bool keepRatio = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keepAspectRatio));
-    //Get the current width and height of the image and get the aspect ratio
-    int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
-    double aspectR = (double)width/height;
-    double sAspectR = (double)scrollWidth/scrollHeight;
+    resizeImage(widget, NULL); //Resize image to fit scroll box
 
-
-    //Here we make sure if we are keeping the aspect ratio we also make the image larger than the scollBox
-    width = scrollWidth, height = (int)(width/aspectR);
-    //If the aspect ratio (w/h) of the image is greater than the aspect ratio (w/h) of the screen, it means we have to set the image in relation to the height rather than the width to make it take up the entire screen.
-    if (aspectR > sAspectR) height = scrollHeight, width = (int)(height*aspectR);
-
-    //If we don't keep the aspect ratio just make it the same size as the scroll window
-    if (!keepRatio) {width = scrollWidth, height = scrollHeight;}
-
-    //Resize the pixbuf image
-    currentPix = gdk_pixbuf_scale_simple(originalImagePix, width, height, GDK_INTERP_NEAREST);
-
-    //Set the pixbuf to the image view
-    gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);
-
-    currentImageWidth = width;
-    currentImageHeight = height;
-
-    g_object_unref(currentPix);
     g_free(filePath);
   }
 
   gtk_widget_destroy(GTK_WIDGET(chooser));
 } //FUNCTION END
 
+void saveFile(GtkWidget *widget, gpointer data) {
+    if (originalImagePix == NULL) return;
+    
+    GtkFileChooser *chooser = GTK_FILE_CHOOSER(gtk_file_chooser_dialog_new("Save Image", GTK_WINDOW(gtk_widget_get_toplevel(image)),GTK_FILE_CHOOSER_ACTION_SAVE, "_Cancel", GTK_RESPONSE_CANCEL,"_Save", GTK_RESPONSE_ACCEPT, NULL));
+
+    gtk_file_chooser_set_current_name(chooser, "image.png");
+    int res = gtk_dialog_run(GTK_DIALOG(chooser));
+    if (res == GTK_RESPONSE_ACCEPT) {
+      char *filePath = gtk_file_chooser_get_filename(chooser);
+      gdk_pixbuf_save(originalImagePix, filePath, "png", NULL, NULL);
+      g_free(filePath);
+    }
+    gtk_widget_destroy(GTK_WIDGET(chooser));
+}
+
 void resizeImage(GtkWidget *widget, gpointer data) { //Called when the resize button is clicked
   if (originalImagePix == NULL) return;
   
+  //Here we make sure if we are keeping the aspect ratio we also make the image larger than the scollBox
   bool keepRatio = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keepAspectRatio));
+
   //Get the current width and height of the image and get the aspect ratio
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
   double aspectR = (double)width/height;
   double sAspectR = (double)scrollWidth/scrollHeight;
 
+ //If the aspect ratio (w/h) of the image is greater than the aspect ratio (w/h) of the screen, it means we have to set the image in relation to the height rather than the width to make it take up the entire screen.
   width = scrollWidth, height = (int)(width/aspectR);
   if (aspectR > sAspectR) height = scrollHeight, width = (int)(height*aspectR);
 
+   //If we don't keep the aspect ratio just make it the same size as the scroll window
   if (!keepRatio) {width = scrollWidth, height = scrollHeight;}
 
-  currentPix = gdk_pixbuf_scale_simple(originalImagePix, width, height, GDK_INTERP_NEAREST);
-  gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);
-
+  currentPix = gdk_pixbuf_scale_simple(originalImagePix, width, height, GDK_INTERP_NEAREST); //Resize the pixbuf image
+  gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);  //Set the pixbuf to the image view
+ 
   currentImageWidth = width;
   currentImageHeight = height;
+
   g_object_unref(currentPix);
 } //FUNCTION END
 
@@ -314,6 +321,41 @@ bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Ca
     gtk_adjustment_set_value(vAdj, gtk_adjustment_get_value(vAdj)+adjY);
   }
   return 1;
+} //FUNCTION END
+void cropImage(GtkWidget *widget, gpointer data) {
+    if (originalImagePix == NULL || (currentImageHeight < scrollHeight || currentImageWidth < scrollWidth)) return;
+    
+    GtkWidget *scroll = GTK_WIDGET(data);
+    GtkAdjustment *hAdj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(scroll)), *vAdj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroll));
+
+    //We set originalImagePix to a resized version of itself that we can use to crop (we need a resizied version of the current zoom since that's how we are referencing pixels)
+    currentPix = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth, currentImageHeight, GDK_INTERP_NEAREST);
+    g_object_unref(originalImagePix);
+    originalImagePix = gdk_pixbuf_copy(currentPix);
+    g_object_unref(currentPix); 
+
+    uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
+    int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
+
+    //CurrentPix is made into a new pixbuf with the height and width of the scroll box, since that is what we reference to crop and what bounds the image
+    currentPix = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, scrollWidth, scrollHeight);
+    int rowstrideNew = gdk_pixbuf_get_rowstride(currentPix);
+    uc* pixelsNew = gdk_pixbuf_get_pixels(currentPix); 
+
+    int startingPixelWidth = (int)gtk_adjustment_get_value(hAdj), startingPixelHeight = (int)gtk_adjustment_get_value(vAdj);
+    for (int i = startingPixelHeight; i < scrollHeight+startingPixelHeight; i++) {
+      for (int j = startingPixelWidth; j < scrollWidth+startingPixelWidth; j++) {
+        int offsetNew = ((i-startingPixelHeight)*rowstrideNew) + (j-startingPixelWidth)*channels, offset = i*rowstride + j*channels;
+        editPixel(pixelsNew, pixels, offsetNew, offset, channels);
+      } 
+    }
+    currentImageHeight = scrollHeight;
+    currentImageWidth = scrollWidth;
+
+    g_object_unref(originalImagePix);
+    originalImagePix = gdk_pixbuf_copy(currentPix);
+    g_object_unref(currentPix); 
+    resizeImage(widget, NULL);
 } //FUNCTION END
 
 
