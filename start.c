@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <math.h>
+#include <string.h>
+#include <sys/stat.h>
+#define SAVE_CONTENT_PATH "SaveContent/image%d.jpeg" //This is used in the functions that work with redoing/undoing the image
 
 typedef unsigned char uc;
 typedef struct { //This struct is used so we can successfully pass in parameters into the editAllPixels function via a g_signal_connect
@@ -11,29 +14,24 @@ typedef struct { //This struct is used so we can successfully pass in parameters
   int factor;
 } EditArgs;
 
-//Image with original aspect ratio
-GdkPixbuf *originalImagePix = NULL;
-//Image placeholder
-GdkPixbuf *currentPix = NULL;
-//Current image width and height (resized)
-int currentImageWidth, currentImageHeight;
+GdkPixbuf *originalImagePix = NULL; //Image with original aspect ratio
+GdkPixbuf *currentPix = NULL; //Image placeholder
+char *orignalImagePath = NULL; //Stores the path of the original image so we can revert if requested by the user
+int currentImageWidth, currentImageHeight; //Current image width and height (resized)
 
-//The image container
-GtkWidget *image;
-//Check Button which maintains aspect ratio if selected
-GtkWidget *keepAspectRatio;
-//The scrolled window widget width and height 
-int scrollWidth = 725, scrollHeight = 725;
+GtkWidget *image; //The image container
+GtkWidget *keepAspectRatio; //Check Button which maintains aspect ratio if selected
+int scrollWidth = 725, scrollHeight = 725; //The scrolled window widget width and height 
+int zoomLevel = 40; //This is the amount of pixels we zoom in by the y when scrolling (By default)
 
-//Color Button
-GtkWidget *colorBtn;
-//Entry box where users can type scale factors when modifying an image
-GtkWidget *entry;
+int modificationCounter = 0; //Tracks the amount of modifications made to the original image
+int maxRedo = 0; //Signifies the max image you can redo to, if it's 0 you are unable to redo
 
-//Are we currently moving through our image?
-bool movingImage = false;
-//These are initially set in "onImageClick()", they represent the previous position of the mouse while dragging through the image
-int xMove, yMove;
+GtkWidget *colorBtn; //Color Button
+GtkWidget *entry; //Entry box where users can type scale factors when modifying an image (This widget is in the modify dialog)
+
+bool movingImage = false; //Are we currently moving through our image?
+int xMove, yMove; //These are initially set in "onImageClick()", they represent the previous position of the mouse while dragging through the image
 
 
 void windowResized(GtkWidget *widget, GdkRectangle *allocation, gpointer data); //Call when the window is resized
@@ -60,9 +58,14 @@ void flop(GtkWidget *widget, gpointer data);
 void rotateRight(GtkWidget *widget, gpointer data);
 void rotateLeft(GtkWidget *widget, gpointer data);
 void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int channels);
+void revertImage(GtkWidget *widget, gpointer data);
+void redoImage(GtkWidget *widget, gpointer data);
+void trackModification();
+void resizeSpecific(GtkWidget *widget, gpointer data);
+void changeZoomLevel(GtkWidget *widget, gpointer data);
 
 
-void activate(GtkApplication *app, gpointer data) {
+void activate(GtkApplication *app, gpointer data) { //----------------------------------------------------------------------------------------------------------------------------------
   GtkWidget *window = gtk_application_window_new(app);
   gtk_window_set_default_size(GTK_WINDOW(window), scrollWidth, scrollHeight);
   gtk_container_set_border_width(GTK_CONTAINER(window), 10);
@@ -145,6 +148,11 @@ int main(int argc, char *argv[]) {
   int ret = g_application_run(G_APPLICATION(app), argc, argv);
   
   g_object_unref(app); 
+  char filePath[30];
+  for (int i = 1; i <= maxRedo || i <= modificationCounter; i++) { //Clear the saved content since we closed the app
+    sprintf(filePath, SAVE_CONTENT_PATH, i);
+    remove(filePath);
+  } 
   return ret;
 }
 
@@ -160,20 +168,32 @@ void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose fil
   GtkFileChooser *chooser = GTK_FILE_CHOOSER(gtk_file_chooser_dialog_new("Open File", GTK_WINDOW(gtk_widget_get_toplevel(image)),GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel", GTK_RESPONSE_CANCEL,"_Open", GTK_RESPONSE_ACCEPT, NULL));
   int res = gtk_dialog_run(GTK_DIALOG(chooser));
   if (res == GTK_RESPONSE_ACCEPT) {
-    
-    //If the originalImagePix exists unref it since we reset it here
-    if (originalImagePix != NULL) g_object_unref(originalImagePix);
+
+    char filePath[30];
+    for (int i = 1; i <= maxRedo || i <= modificationCounter; i++) { //Clear the saved content from the previous image
+      sprintf(filePath, SAVE_CONTENT_PATH, i);
+      remove(filePath);
+    } 
+    modificationCounter = 0, maxRedo = 0; //Reset the modification counter and maxRedo
+
+
+    //If the originalImagePix exists unref it and the originalPath since we reset it here
+    if (originalImagePix != NULL) {
+       g_object_unref(originalImagePix);
+       g_free(orignalImagePath);
+    }
 
     //Grab the file path that was given by the file chooser dialog
-    char *filePath = gtk_file_chooser_get_filename(chooser);
+    orignalImagePath = gtk_file_chooser_get_filename(chooser);
+
     //Use the file path to load and image
-    originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
+    originalImagePix = gdk_pixbuf_new_from_file(orignalImagePath, NULL);
+
     //If it wasn't an image then break the program lol
     if (originalImagePix == NULL) exit(1);
+    mkdir("SaveContent", 0777); //Creates a new directory called SaveContent so we can use undo/redo
 
     resizeImage(widget, NULL); //Resize image to fit scroll box
-
-    g_free(filePath);
   }
 
   gtk_widget_destroy(GTK_WIDGET(chooser));
@@ -205,9 +225,9 @@ void resizeImage(GtkWidget *widget, gpointer data) { //Called when the resize bu
   double aspectR = (double)width/height;
   double sAspectR = (double)scrollWidth/scrollHeight;
 
- //If the aspect ratio (w/h) of the image is greater than the aspect ratio (w/h) of the screen, it means we have to set the image in relation to the height rather than the width to make it take up the entire screen.
-  width = scrollWidth, height = (int)(width/aspectR);
-  if (aspectR > sAspectR) height = scrollHeight, width = (int)(height*aspectR);
+  //If the aspect ratio (w/h) of the image is greater than the aspect ratio (w/h) of the screen, it means we have to set the image in relation to the height rather than the width to make it take up the entire screen.
+  width = scrollWidth, height = (int)(width/aspectR); //width after the , is actually now scrollWidth
+  if (aspectR > sAspectR) height = scrollHeight, width = (int)(height*aspectR); //height after the , is actually now scrollHeight
 
    //If we don't keep the aspect ratio just make it the same size as the scroll window
   if (!keepRatio) {width = scrollWidth, height = scrollHeight;}
@@ -234,11 +254,11 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { /
   //Sometimes delta_y starts at 0 for no reason and it causes weird behavior in the program ;-;
   if (originalImagePix == NULL || event->delta_y == 0) return 1;
 
-  bool zoomIn = event->delta_y <= 0;
-  if ((currentImageHeight > 3000 || currentImageWidth > 3000) && zoomIn) {return 1;} else if((currentImageHeight <= 40 || currentImageWidth <= 40) && !zoomIn) {return 1;}
+  bool zoomIn = event->delta_y <= 0; //This checks if we are scrolling in or out
+  if ((currentImageHeight > 3000 || currentImageWidth > 3000) && zoomIn) {return 1;} else if((currentImageHeight <= zoomLevel || currentImageWidth <= zoomLevel) && !zoomIn) {return 1;}
 
   double aspectR = (double)currentImageWidth/currentImageHeight;
-  int add = zoomIn ? 40 : -40;
+  int add = zoomIn ? zoomLevel : -zoomLevel; //This is the zoomIn add on the height
 
   //Scale the image in relation to its aspect ratio
   currentPix = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth+(int)(add*aspectR), currentImageHeight+add, GDK_INTERP_NEAREST);
@@ -256,10 +276,10 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { /
     When the image gets larger the scroll wheels don't change position. However, the image gets larger and it appears as though the scroll wheels went up and left.
     So when we are adjusting we actually have to account for where the mouse is, if you imagine the opposite (bottom right corner) we want to adjust the maximum amount to keep up.
 
-    This works fine, but it isn't perfect.
+    This works fine, but it isn't perfect. (Fixed version: uses the same logic but uses the position of the mouse on the image instead of the scroll box)
     ------------------------------------------------------------------------------------
   */
-  double displacementV = add*(event->y/scrollHeight), displacementH = ((int)(add*aspectR))*(event->x/scrollWidth);
+  double displacementV = add*((event->y+gtk_adjustment_get_value(vScroll))/currentImageHeight), displacementH = ((int)(add*aspectR))*((event->x+gtk_adjustment_get_value(hScroll))/currentImageWidth);
 
 
   //This is done automatically after the function ends, but we set it here in the case the adjustment value needs to be there
@@ -309,7 +329,7 @@ bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data) { /
 } //FUNCTION END
 
 bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Captures Mouse movement through the image
-  if (movingImage) {
+  if (movingImage) { //movingImage is true if we are holding down on our mouse
     GtkAdjustment *hAdj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(widget));
     GtkAdjustment *vAdj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(widget));
 
@@ -322,6 +342,7 @@ bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Ca
   }
   return 1;
 } //FUNCTION END
+
 void cropImage(GtkWidget *widget, gpointer data) {
     if (originalImagePix == NULL || (currentImageHeight < scrollHeight || currentImageWidth < scrollWidth)) return;
     
@@ -383,7 +404,7 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &editAllPixels, &((EditArgs){&invertPixel, -1}), "Invert");
   modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &editAllPixels, &((EditArgs){&darkenPixel, 2}), "Darken*");
   modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &editAllPixels, &((EditArgs){&lightenPixel, 2}), "Lighten*");
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Page 1"));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Edits"));
   //END OF PAGE 1
 
   //PAGE 2
@@ -392,15 +413,24 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &rotateRight, NULL, "Rotate Right");
   modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &flop, NULL, "Flop");
   modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &rotateLeft, NULL, "Rotate Left");
-  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Page 2"));
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Shifts"));
   //END OF PAGE 2
 
+  //PAGE 3
+  grid = gtk_grid_new();
+  modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &revertImage, NULL, "Revert");
+  modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &resizeSpecific, NULL, "ResizeX");
+  modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &changeZoomLevel, NULL, "ZoomLevel*");
+  modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &redoImage, NULL, "Redo");
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("UTILS"));
+  //END OF PAGE 3
 
   gtk_widget_show_all(dialog);
   gtk_dialog_run(GTK_DIALOG(dialog));
 
   gtk_widget_destroy(dialog);
 } //FUNCTION END
+
 /*
  * gird - grid the widget is part of
  * gridPos - grid parameters as an array
@@ -416,10 +446,10 @@ void modifyButtonCreate(GtkWidget *grid, int gridPos[4], void (*func)(GtkWidget*
 } //FUNCTION END
 
 
-/* ---------------------------------------------
+/* ------------------------------------------------------------------------------------------
  * IMAGE MODIFIER FUNCTIONS
  * All image modifier functions exist below here
- * --------------------------------------------- 
+ * ------------------------------------------------------------------------------------------
 */
 void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algorithm to all pixels in the originalImagePix
     EditArgs *args = (EditArgs *)data;
@@ -449,6 +479,7 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
       }
     }
     resizeImage(widget, NULL);
+    trackModification();
 } //FUNCTION END
 
 
@@ -512,6 +543,7 @@ void flip(GtkWidget *widget, gpointer data) { //Flip the image
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
+   trackModification();
 } //FUNCTION END
 
 
@@ -543,6 +575,7 @@ void flop(GtkWidget *widget, gpointer data) { //Flop the image
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
+  trackModification();
 } //FUNCTION END
 
 
@@ -579,6 +612,7 @@ void rotateRight(GtkWidget *widget, gpointer data) { //Rotate an image right
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
+  trackModification();
 } //FUNCTION END
 
 
@@ -614,6 +648,77 @@ void rotateLeft(GtkWidget *widget, gpointer data) { //Rotates an image left
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
+  trackModification();
+} //FUNCTION END
+
+
+void trackModification() { //Tracks the amount of modifications done to the image
+  char filePath[30]; //SaveContent/image.jpeg is 22 characters + the null terminator making it 23, so you can have up to 10^7 - 1 (7 digits max) image saves lol
+
+  for (int i = modificationCounter+1; i <= maxRedo; i++) { //Since we just made a new modification we should no longer be able to redo (Get rid of all images saved for redo)
+    sprintf(filePath, SAVE_CONTENT_PATH, i);
+    remove(filePath);
+  }
+  maxRedo = 0;
+  strcpy(filePath, ""); //Clear filepath array
+
+  sprintf(filePath, SAVE_CONTENT_PATH, ++modificationCounter);
+  gdk_pixbuf_save(originalImagePix, filePath, "jpeg", NULL, NULL);
+} //FUNCTION END
+
+void revertImage(GtkWidget *widget, gpointer data) { //revert image to older version (undo function)
+  if (maxRedo == 0) maxRedo = modificationCounter; //Save the max redo
+
+  g_object_unref(originalImagePix);
+  if (modificationCounter >= 1) modificationCounter--; //Alter modification counter for undo
+
+  if (modificationCounter < 1) {
+    originalImagePix = gdk_pixbuf_new_from_file(orignalImagePath, NULL); //Sets the originalImagePix to the actual originally selected image
+  } else {
+    char filePath[30]; //SaveContent/image.jpeg is 22 characters + the null terminator making it 23, so you can have up to 10^7 - 1 (7 digits max) image saves lol
+    sprintf(filePath, SAVE_CONTENT_PATH, modificationCounter);
+  
+    originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
+  }
+  resizeImage(widget, NULL);
+} //FUNCTION END
+void redoImage(GtkWidget *widget, gpointer data) {
+  if (modificationCounter < maxRedo) {
+    g_object_unref(originalImagePix);
+
+    char filePath[30];
+    sprintf(filePath, SAVE_CONTENT_PATH, ++modificationCounter);
+    originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
+    resizeImage(widget, NULL);
+  }
+}
+
+
+
+void resizeSpecific(GtkWidget *widget, gpointer data) { //Resizies an image to specific dimensions (Changes original image for saving purposes)
+  char *text = (char*)gtk_entry_get_text(GTK_ENTRY(entry));
+  if (strchr(text, 'x') == NULL) return;
+
+  int width = atoi(text); //Gives the number before x in e.g 500x500
+  int height = atoi(strchr(text, 'x')+1); //Gives the number after x in e.g 500x500
+  if (width <= 0 || height <= 0) return;
+
+  currentPix = gdk_pixbuf_scale_simple(originalImagePix, width, height, GDK_INTERP_NEAREST);
+
+  g_object_unref(originalImagePix);
+  originalImagePix = gdk_pixbuf_copy(currentPix);
+  g_object_unref(currentPix);
+
+  gtk_image_set_from_pixbuf(GTK_IMAGE(image), originalImagePix);
+
+  currentImageWidth = width;
+  currentImageHeight = height;
+} //FUNCTION END
+
+
+void changeZoomLevel(GtkWidget *widget, gpointer data) { //Changes the zoom level for when you scroll on an image
+    int newLevel = atoi(gtk_entry_get_text(GTK_ENTRY(entry)));
+    if (newLevel >= 1 && newLevel <= 1000) zoomLevel = newLevel; 
 } //FUNCTION END
 
 
@@ -627,5 +732,4 @@ void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int c
     if (channels == 4) pixelsNew[offsetNew + 3] = pixelsOld[offsetOld + 3];
   */
 } //FUNCTION END
-
 
