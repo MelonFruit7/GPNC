@@ -5,13 +5,14 @@
 #include <stdbool.h>
 #include <math.h>
 #include <string.h>
-#include <sys/stat.h>
+#include <sys/stat.h> //Let's us use mkdir
 #define SAVE_CONTENT_PATH "SaveContent/image%d.jpeg" //This is used in the functions that work with redoing/undoing the image
 
 typedef unsigned char uc;
 typedef struct { //This struct is used so we can successfully pass in parameters into the editAllPixels function via a g_signal_connect
-  uc* (*operation)(uc*, int);
+  uc* (*operation)(); //If I don't specify params then I can put in as many as I need (idk why this works tbh)
   int factor;
+  int params;
 } EditArgs;
 
 GdkPixbuf *originalImagePix = NULL; //Image with original aspect ratio
@@ -49,14 +50,15 @@ void cropImage(GtkWidget *widget, gpointer data); //Crop the image
 
 //Modify image functions
 void editAllPixels(GtkWidget *widget, gpointer data);
-uc* greyscalePixel(uc* rgb, int factor);
-uc* invertPixel(uc* rgb, int factor);
+uc* greyscalePixel(uc* rgb);
+uc* invertPixel(uc* rgb);
 uc* darkenPixel(uc* rgb, int factor);
 uc* lightenPixel(uc* rgb, int factor);
 void flip(GtkWidget *widget, gpointer data);
 void flop(GtkWidget *widget, gpointer data);
 void rotateRight(GtkWidget *widget, gpointer data);
 void rotateLeft(GtkWidget *widget, gpointer data);
+uc* swirlImage(uc* rgb, int factor, int x, int y);
 void editPixel(uc *pixelsNew, uc* pixelsOld, int offsetNew, int offsetOld, int channels);
 void revertImage(GtkWidget *widget, gpointer data);
 void redoImage(GtkWidget *widget, gpointer data);
@@ -377,6 +379,7 @@ void cropImage(GtkWidget *widget, gpointer data) {
     originalImagePix = gdk_pixbuf_copy(currentPix);
     g_object_unref(currentPix); 
     resizeImage(widget, NULL);
+    trackModification();
 } //FUNCTION END
 
 
@@ -398,32 +401,38 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), grid);
 
   //Modifier Button order (0,0) -> (0,1) -> (1,0) -> (1,1)
-  //PAGE 1 
+  //EDITS
   grid = gtk_grid_new();
-  modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &editAllPixels, &((EditArgs){&greyscalePixel, -1}), "Greyscale");
-  modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &editAllPixels, &((EditArgs){&invertPixel, -1}), "Invert");
-  modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &editAllPixels, &((EditArgs){&darkenPixel, 2}), "Darken*");
-  modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &editAllPixels, &((EditArgs){&lightenPixel, 2}), "Lighten*");
+  modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &editAllPixels, &((EditArgs){&greyscalePixel, -1, 1}), "Greyscale");
+  modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &editAllPixels, &((EditArgs){&invertPixel, -1, 1}), "Invert");
+  modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &editAllPixels, &((EditArgs){&darkenPixel, 2, 2}), "Darken*");
+  modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &editAllPixels, &((EditArgs){&lightenPixel, 2, 2}), "Lighten*");
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Edits"));
-  //END OF PAGE 1
+  //END OF EDITS
 
-  //PAGE 2
+  //EDITS 2
+  grid = gtk_grid_new();
+  modifyButtonCreate(grid, (int[]){0,0,1,1}, &editAllPixels, &((EditArgs){&swirlImage, 1, 4}), "Swirl*");
+  gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Edits 2"));
+  //END OF EDITS 2
+
+  //SHIFTS
   grid = gtk_grid_new();
   modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &flip, NULL, "Flip");
   modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &rotateRight, NULL, "Rotate Right");
   modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &flop, NULL, "Flop");
   modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &rotateLeft, NULL, "Rotate Left");
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("Shifts"));
-  //END OF PAGE 2
+  //END OF SHIFTS
 
-  //PAGE 3
+  //UTILS
   grid = gtk_grid_new();
   modifyButtonCreate(grid, (int[]){0, 0, 1, 1}, &revertImage, NULL, "Revert");
   modifyButtonCreate(grid, (int[]){0, 1, 1, 1}, &resizeSpecific, NULL, "ResizeX");
   modifyButtonCreate(grid, (int[]){1, 0, 1, 1}, &changeZoomLevel, NULL, "ZoomLevel*");
   modifyButtonCreate(grid, (int[]){1, 1, 1, 1}, &redoImage, NULL, "Redo");
   gtk_notebook_append_page(GTK_NOTEBOOK(notebook), grid, gtk_label_new("UTILS"));
-  //END OF PAGE 3
+  //END OF UTILS
 
   gtk_widget_show_all(dialog);
   gtk_dialog_run(GTK_DIALOG(dialog));
@@ -455,16 +464,18 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
     EditArgs *args = (EditArgs *)data;
 
     int factor = atoi(gtk_entry_get_text(GTK_ENTRY(entry)));
-    if (factor <= 1) factor = args->factor;
+    if (factor <= 1) factor = args->factor; //Factor for the operation
+    int params = args->params; //Amount of parameters in the operation function
 
-    uc *pixels = gdk_pixbuf_get_pixels(originalImagePix); //Take pixels from the originalImagePix
+    currentPix = gdk_pixbuf_copy(originalImagePix);
+    uc *pixels = gdk_pixbuf_get_pixels(currentPix); //Take pixels from the currentPix
     /*
       Get the size of each row and the amount of channels in the image
       If an image only give you rgb that means it has 3 channels such as in a jpg, if it gives you rgba like in a png that means it has 4 channels.
     */
-    int rowStride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
+    int rowStride = gdk_pixbuf_get_rowstride(currentPix), channels = gdk_pixbuf_get_n_channels(currentPix);
 
-    int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix); //width and height of the original image
+    int width = gdk_pixbuf_get_width(currentPix), height = gdk_pixbuf_get_height(currentPix); //width and height of the original image
 
     for (int i = 0; i < height; i++) {
       for (int j = 0; j < width; j++) {
@@ -472,24 +483,34 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
         uc* rgb = malloc(3*sizeof(uc));
         editPixel(rgb, pixels, 0, offset, 3); //Edit pixel
 
-        uc* newPixel = args->operation(rgb, factor);
+        uc* newPixel;
+        switch (params) {
+           case 1: newPixel=args->operation(rgb);
+           break;
+           case 2: newPixel=args->operation(rgb, factor);
+           break;
+           case 4: newPixel=args->operation(rgb, factor, j, i);
+        }
         editPixel(pixels, newPixel, offset, 0, 3); //Edit pixel
         free(rgb);
         free(newPixel);
       }
     }
+    g_object_unref(originalImagePix);
+    originalImagePix = gdk_pixbuf_copy(currentPix);
+    g_object_unref(currentPix);
     resizeImage(widget, NULL);
     trackModification();
 } //FUNCTION END
 
 
-uc* greyscalePixel(uc* rgb, int factor) { //Greyscale a pixel
+uc* greyscalePixel(uc* rgb) { //Greyscale a pixel
   uc* pixel = malloc(3 * sizeof(uc));
   pixel[0] = pixel[1] = pixel[2] = (rgb[0]+rgb[1]+rgb[2])/3;
   return pixel;
 } //FUNCTION END
 
-uc* invertPixel(uc* rgb, int factor) { //Invert a pixel
+uc* invertPixel(uc* rgb) { //Invert a pixel
   uc* pixel = malloc(3 * sizeof(uc));
   pixel[0] = 255 - rgb[0];
   pixel[1] = 255 - rgb[1];
@@ -512,6 +533,26 @@ uc* lightenPixel(uc* rgb, int factor) { //Lighten a pixel
   pixel[2] = (int)(pow(rgb[2]/255.0, 1/(double)factor)*255);
   return pixel;
 } //FUNCTION END
+uc* swirlImage(uc* rgb, int factor, int x, int y) {
+  int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
+  double dx = x - width/2.0; //Distance away from middle on the x
+  double dy = y - height/2.0; //Distance away from middle on the y
+  double angle = atan2(dy, dx);
+  double radius = sqrt(dx*dx + dy*dy);
+  double swirl = radius * (factor/1000.0);
+  
+  int sourceX = (int)(radius * cos(angle + swirl) + width / 2.0);
+  int sourceY = (int)(radius * sin(angle + swirl) + height / 2.0);
+
+  uc* pixel = malloc(3 * sizeof(uc));
+  if (sourceX >= 0 && sourceX < width && sourceY >= 0 && sourceY < height) {
+    uc* originalPixels = gdk_pixbuf_get_pixels(originalImagePix) + sourceY*gdk_pixbuf_get_rowstride(originalImagePix) + sourceX*gdk_pixbuf_get_n_channels(originalImagePix); //Pointer Arithmatic
+    editPixel(pixel, originalPixels, 0, 0, 3);
+  } else {
+    editPixel(pixel, rgb, 0, 0, 3);
+  }
+  return pixel;
+} 
 
 
 void flip(GtkWidget *widget, gpointer data) { //Flip the image
