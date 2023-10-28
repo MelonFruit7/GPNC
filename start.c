@@ -16,6 +16,7 @@ typedef struct { //This struct is used so we can successfully pass in parameters
 } EditArgs;
 
 GdkPixbuf *originalImagePix = NULL; //Image with original aspect ratio
+GdkPixbuf *quickSelectBitMap = NULL; //Bit map for quick selection
 GdkPixbuf *currentPix = NULL; //Image placeholder
 char *orignalImagePath = NULL; //Stores the path of the original image so we can revert if requested by the user
 int currentImageWidth, currentImageHeight; //Current image width and height (resized)
@@ -32,10 +33,15 @@ GtkWidget *colorBtn; //Color Button
 GtkWidget *entry; //Entry box where users can type scale factors when modifying an image (This widget is in the modify dialog)
 
 bool movingImage = false; //Are we currently moving through our image?
+bool quickSelecting = false, quickSelectionOn = false; //Are we currently quick selecting something?
+uc quickSelectionColor = 255;
 int xMove, yMove; //These are initially set in "onImageClick()", they represent the previous position of the mouse while dragging through the image
+int prevXMove, prevYMove; //These store the previous position of our mouse as captured in the "onImageMove" function (They are currently only in use for quick selection)
 
 
 void windowResized(GtkWidget *widget, GdkRectangle *allocation, gpointer data); //Call when the window is resized
+bool keyPress(GtkWidget *widget, GdkEventKey *event, gpointer data); //Detects key press
+void reDrawImage(); //Redraw the image
 void resizeImage(GtkWidget *widget, gpointer data); //Call when the window is resized
 void chooseFile(GtkWidget *widget, gpointer data); //Function to choose a file
 void saveFile(GtkWidget *widget, gpointer data); //Function to save a file
@@ -44,6 +50,9 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data); //
 bool onImageClick(GtkWidget *widget, GdkEventButton *event, gpointer data); //Called when you click the image
 bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data); //Called when you release the image
 bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data); //Called while you are dragging the image
+void drawQuickSelect(int x, int y); //Quick Selection drawing helper
+void connectPixelQuickSelect(uc *pixels, int x1, int y1, int x2, int y2, int rowstride, int channels, uc* pixelConnect); //connect 2 pixels (not a very good method might change later)
+GdkPixbuf* applyBitmap(GdkPixbuf *apply); //Apply a bitmap to an image and return a resulting image
 void modifyImageDialog(GtkWidget *widget, gpointer data); //Called when user wants to modify the image
 void modifyButtonCreate(GtkWidget *grid, int gridPos[4], void (*func)(GtkWidget*, gpointer), gpointer data, char* name); //Creates buttons for the modifyImageDialog
 void cropImage(GtkWidget *widget, gpointer data); //Crop the image
@@ -71,7 +80,7 @@ void activate(GtkApplication *app, gpointer data) { //--------------------------
   GtkWidget *window = gtk_application_window_new(app);
   gtk_window_set_default_size(GTK_WINDOW(window), scrollWidth, scrollHeight);
   gtk_container_set_border_width(GTK_CONTAINER(window), 10);
-  gtk_window_set_title(GTK_WINDOW(window), "Image Modifier");
+  gtk_window_set_title(GTK_WINDOW(window), "GPNC (General Purpose Network-graphic Controller)");
 
   //CSS provider (lets us now where the css file is)
   GtkCssProvider *cssProvider = gtk_css_provider_new();
@@ -119,6 +128,7 @@ void activate(GtkApplication *app, gpointer data) { //--------------------------
   gtk_container_add(GTK_CONTAINER(eventBox), image);
 
   //Signal events
+  g_signal_connect(window, "key-press-event", G_CALLBACK(keyPress), NULL);
   g_signal_connect(fileChooser, "clicked", G_CALLBACK(chooseFile), NULL);
   g_signal_connect(saveBtn, "clicked", G_CALLBACK(saveFile), NULL);
   g_signal_connect(resizeBtn, "clicked", G_CALLBACK(resizeImage), NULL);
@@ -126,7 +136,7 @@ void activate(GtkApplication *app, gpointer data) { //--------------------------
   g_signal_connect(scrollBox, "scroll-event", G_CALLBACK(scrolledResize), NULL);
   g_signal_connect(eventBox, "button-press-event", G_CALLBACK(onImageClick), NULL);
   g_signal_connect(eventBox, "button-release-event", G_CALLBACK(onImageRelease), NULL);
-  g_signal_connect(scrollBox, "motion-notify-event", G_CALLBACK(onImageMove), NULL);
+  g_signal_connect(eventBox, "motion-notify-event", G_CALLBACK(onImageMove), scrollBox);
   g_signal_connect(modifyBtn, "clicked", G_CALLBACK(modifyImageDialog), NULL);
   g_signal_connect(cropBtn, "clicked", G_CALLBACK(cropImage), scrollBox);
   
@@ -165,7 +175,19 @@ void defineCSS(GtkWidget *widget, GtkCssProvider *cssProvider, char* class) { //
   gtk_style_context_add_class(context, class);
 } //FUNCTION END
 
+bool keyPress(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    if (event->keyval == GDK_KEY_Escape && !quickSelecting && quickSelectionOn) { //Click escape to get out of quick selection
+        //Clear and turn everything off relating to quick selection, then redraw the image
+        if (quickSelectBitMap != NULL) g_object_unref(quickSelectBitMap);
+        quickSelectBitMap = NULL;
+        quickSelectionOn = false;
+        reDrawImage();
+    }
+    return FALSE;
+}
+
 void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose file button is clicked
+  if (quickSelectionOn) return;
 
   GtkFileChooser *chooser = GTK_FILE_CHOOSER(gtk_file_chooser_dialog_new("Open File", GTK_WINDOW(gtk_widget_get_toplevel(image)),GTK_FILE_CHOOSER_ACTION_OPEN, "_Cancel", GTK_RESPONSE_CANCEL,"_Open", GTK_RESPONSE_ACCEPT, NULL));
   int res = gtk_dialog_run(GTK_DIALOG(chooser));
@@ -173,7 +195,7 @@ void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose fil
 
     char filePath[30];
     for (int i = 1; i <= maxRedo || i <= modificationCounter; i++) { //Clear the saved content from the previous image
-      sprintf(filePath, SAVE_CONTENT_PATH, i);
+      sprintf(filePath, SAVE_CONTENT_PATH, i); //SAVE_CONTENT_PATH is a #define
       remove(filePath);
     } 
     modificationCounter = 0, maxRedo = 0; //Reset the modification counter and maxRedo
@@ -204,20 +226,27 @@ void chooseFile(GtkWidget *widget, gpointer data) { //Called when the choose fil
 void saveFile(GtkWidget *widget, gpointer data) {
     if (originalImagePix == NULL) return;
     
+    //Open file chooser dialog
     GtkFileChooser *chooser = GTK_FILE_CHOOSER(gtk_file_chooser_dialog_new("Save Image", GTK_WINDOW(gtk_widget_get_toplevel(image)),GTK_FILE_CHOOSER_ACTION_SAVE, "_Cancel", GTK_RESPONSE_CANCEL,"_Save", GTK_RESPONSE_ACCEPT, NULL));
 
     gtk_file_chooser_set_current_name(chooser, "image.png");
     int res = gtk_dialog_run(GTK_DIALOG(chooser));
-    if (res == GTK_RESPONSE_ACCEPT) {
+    if (res == GTK_RESPONSE_ACCEPT) { //If the user clicked save
       char *filePath = gtk_file_chooser_get_filename(chooser);
-      gdk_pixbuf_save(originalImagePix, filePath, "png", NULL, NULL);
+      gdk_pixbuf_save(originalImagePix, filePath, "png", NULL, NULL); //Save the image at the filepath in png format
       g_free(filePath);
     }
     gtk_widget_destroy(GTK_WIDGET(chooser));
 }
 
+
+void reDrawImage() { //Will redraw the pixbuf onto the image widget
+  GdkPixbuf *temp = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth, currentImageHeight, GDK_INTERP_NEAREST);
+  gtk_image_set_from_pixbuf(GTK_IMAGE(image), temp);
+  g_object_unref(temp);
+} //FUNCTION END
 void resizeImage(GtkWidget *widget, gpointer data) { //Called when the resize button is clicked
-  if (originalImagePix == NULL) return;
+  if (originalImagePix == NULL || quickSelectionOn) return;
   
   //Here we make sure if we are keeping the aspect ratio we also make the image larger than the scollBox
   bool keepRatio = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(keepAspectRatio));
@@ -233,7 +262,7 @@ void resizeImage(GtkWidget *widget, gpointer data) { //Called when the resize bu
 
    //If we don't keep the aspect ratio just make it the same size as the scroll window
   if (!keepRatio) {width = scrollWidth, height = scrollHeight;}
-
+  
   currentPix = gdk_pixbuf_scale_simple(originalImagePix, width, height, GDK_INTERP_NEAREST); //Resize the pixbuf image
   gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);  //Set the pixbuf to the image view
  
@@ -252,6 +281,7 @@ void windowResized(GtkWidget *widget, GdkRectangle *allocation, gpointer data) {
 } //FUNCTION END
 
 bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { //Called when you scroll on the image
+  if (quickSelectionOn) return 1; //No zooming while quick selecting
 
   //Sometimes delta_y starts at 0 for no reason and it causes weird behavior in the program ;-;
   if (originalImagePix == NULL || event->delta_y == 0) return 1;
@@ -302,38 +332,71 @@ bool scrolledResize(GtkWidget *widget, GdkEventScroll *event, gpointer data) { /
 } //FUNCTION END
 
 bool onImageClick(GtkWidget *widget, GdkEventButton *event, gpointer data) { //Called when you click on the image
-  if (event->button == GDK_BUTTON_PRIMARY) {
-    movingImage = true;
+  int startPosW = currentImageWidth < scrollWidth ? (scrollWidth-currentImageWidth)/2 : 0; //The x position where the image starts appearing on the display
+  int startPosH = currentImageHeight < scrollHeight ? (scrollHeight-currentImageHeight)/2 : 0; //The y position where the image starts appearing on the display
+  if (event->x <= startPosW || event->x >= startPosW+currentImageWidth || event->y <= startPosH || event->y >= startPosH+currentImageHeight) return 1; //Didn't click on the image
+
+  if (event->button == GDK_BUTTON_PRIMARY && !quickSelecting) { //User wants to pan through the image
     xMove = event->x;
     yMove = event->y;
+    
+    movingImage = true;
 
     if (originalImagePix != NULL) {
       currentPix = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth, currentImageHeight, GDK_INTERP_NEAREST);
       uc *pixels = gdk_pixbuf_get_pixels(currentPix);
       int rowstride = gdk_pixbuf_get_rowstride(currentPix), channels = gdk_pixbuf_get_n_channels(currentPix);
+
       GdkRGBA color;
-      int offset = yMove*rowstride + xMove*channels;
+      int offset = (yMove-startPosH)*rowstride + (xMove-startPosW)*channels; //Find the offset to get to the pixel we clicked on
       color.red = pixels[offset]/255.0;
       color.green = pixels[offset+1]/255.0;
       color.blue = pixels[offset+2]/255.0;
       color.alpha = 1.0;
-      gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(colorBtn), &color);
+      gtk_color_chooser_set_rgba(GTK_COLOR_CHOOSER(colorBtn), &color); //Set the color of the color button to the color of the pixel we clicked on
       g_object_unref(currentPix);
     }
+  } else if (event->button == GDK_BUTTON_SECONDARY && !movingImage) { //User wants to use quick selection tool
+    xMove = event->x;
+    yMove = event->y;
+    quickSelecting = true;
+    quickSelectionOn = true;
 
+    if (quickSelectBitMap == NULL) { //Create a new quickSelectBitMap only if one doesn't currently exist
+      quickSelectBitMap = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (gdk_pixbuf_get_n_channels(originalImagePix) == 4 ? TRUE : FALSE), 8, currentImageWidth, currentImageHeight);
+      int rowstride = gdk_pixbuf_get_rowstride(quickSelectBitMap), channels = gdk_pixbuf_get_n_channels(quickSelectBitMap);
+
+      uc *quickPixels = gdk_pixbuf_get_pixels(quickSelectBitMap);
+      uc *blackPixels = malloc(4*sizeof(uc));
+      for (int i = 0; i < 4; i++) blackPixels[i] = 0;
+
+      for (int i = 0; i < currentImageHeight; i++) { //Initialize all pixels in the bitmap to black
+        for (int j = 0; j < currentImageWidth; j++) {
+          int offset = i*rowstride + j*channels;
+          editPixel(quickPixels, blackPixels, offset, 0, channels);
+        }       
+      }
+      free(blackPixels);
+    }
+
+    
+    GdkPixbuf *temp = gdk_pixbuf_scale_simple(originalImagePix, currentImageWidth, currentImageHeight, GDK_INTERP_NEAREST);
+    currentPix = applyBitmap(temp);
+    g_object_unref(temp);
+
+
+    //Set our previous moves (our moves here are now our previous moves)
+    prevXMove = xMove; 
+    prevYMove = yMove;
+    drawQuickSelect(xMove, yMove);
   }
-  return 1;
-} //FUNCTION END
-
-bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data) { //Called after you release a click on the image
-  if (event->button == GDK_BUTTON_PRIMARY) movingImage = false;
   return 1;
 } //FUNCTION END
 
 bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Captures Mouse movement through the image
   if (movingImage) { //movingImage is true if we are holding down on our mouse
-    GtkAdjustment *hAdj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(widget));
-    GtkAdjustment *vAdj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(widget));
+    GtkAdjustment *hAdj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(data));
+    GtkAdjustment *vAdj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(data));
 
     int adjX = xMove - event->x;
     int adjY = yMove - event->y;
@@ -341,12 +404,97 @@ bool onImageMove(GtkWidget *widget, GdkEventMotion *event, gpointer data) { //Ca
     //Moves scroll wheel based on where our original mouse position was
     gtk_adjustment_set_value(hAdj, gtk_adjustment_get_value(hAdj)+adjX); 
     gtk_adjustment_set_value(vAdj, gtk_adjustment_get_value(vAdj)+adjY);
+  } else if (quickSelecting) {
+    drawQuickSelect((int)event->x, (int)event->y);
+  } 
+  return 1;
+} //FUNCTION END
+
+bool onImageRelease(GtkWidget *widget, GdkEventButton *event, gpointer data) { //Called after you release a click on the image
+  if (event->button == GDK_BUTTON_PRIMARY && movingImage) movingImage = false;
+  if (event->button == GDK_BUTTON_SECONDARY && quickSelecting) {
+     quickSelecting = false;
+     drawQuickSelect(xMove, yMove);
+     g_object_unref(currentPix);
   }
   return 1;
 } //FUNCTION END
 
-void cropImage(GtkWidget *widget, gpointer data) {
-    if (originalImagePix == NULL || (currentImageHeight < scrollHeight || currentImageWidth < scrollWidth)) return;
+void drawQuickSelect(int x, int y) { //Drawing helper for quick selection (x and y should not be adjusted for bounds, it will be done in this function)
+  int startPosW = currentImageWidth < scrollWidth ? (scrollWidth-currentImageWidth)/2 : 0; //The x position where the image starts appearing on the display
+    int startPosH = currentImageHeight < scrollHeight ? (scrollHeight-currentImageHeight)/2 : 0; //The y position where the image starts appearing on the display
+    if (x <= startPosW || x >= startPosW+currentImageWidth || y <= startPosH || y >= startPosH+currentImageHeight) return; //No longer on the image
+
+    uc* pixels = gdk_pixbuf_get_pixels(currentPix);
+    int rowstride = gdk_pixbuf_get_rowstride(currentPix), channels = gdk_pixbuf_get_n_channels(currentPix);
+    uc* colorPixels = malloc(4*sizeof(uc));
+    for (int i = 0; i < 4; i++) colorPixels[i] = quickSelectionColor;
+
+    editPixel(pixels, colorPixels, ((int)y - startPosH)*rowstride + ((int)x - startPosW)*channels, 0, channels); //Paint a single pixel
+    //Connect current recorded mouse position and previous recorded mouse position with pixels to fill in gaps
+    connectPixelQuickSelect(pixels, prevXMove-startPosW, prevYMove-startPosH, ((int)x- startPosW), ((int)y - startPosH), rowstride, channels, colorPixels); 
+
+
+    pixels = gdk_pixbuf_get_pixels(quickSelectBitMap); //Change pixels to the one on the bitmap
+    editPixel(pixels, colorPixels, ((int)y - startPosH)*rowstride + ((int)x - startPosW)*channels, 0, channels);
+    //Connect current recorded mouse position and previous recorded mouse position with pixels to fill in gaps on the bitmap
+    connectPixelQuickSelect(pixels, prevXMove-startPosW, prevYMove-startPosH, ((int)x- startPosW), ((int)y - startPosH), rowstride, channels, colorPixels);
+
+    free(colorPixels);
+    gtk_image_set_from_pixbuf(GTK_IMAGE(image), currentPix);
+
+    prevXMove = (int)x;
+    prevYMove = (int)y;
+} //FUNCTION END
+
+void connectPixelQuickSelect(uc *pixels, int x1, int y1, int x2, int y2, int rowstride, int channels, uc* pixelConnect) { //Simple connect pixels
+  //This works for our purposes but if I wanted to make this better I could work with slopes.
+  int xStep = x2-x1>=0 ? 1 : -1;
+  while (x1 != x2) {
+    x1 += xStep;
+    editPixel(pixels, pixelConnect, y1*rowstride + x1*channels, 0, channels);  
+  }
+  int yStep = y2-y1>=0 ? 1 : -1;
+  while (y1 != y2) {
+    y1 += yStep;
+    editPixel(pixels, pixelConnect, y1*rowstride + x1*channels, 0, channels);  
+  }
+} //FUNCTION END
+
+GdkPixbuf* applyBitmap(GdkPixbuf *apply) { //Returns a pixbuf of an image masked by a bitmap
+  int width = gdk_pixbuf_get_width(apply), height = gdk_pixbuf_get_height(apply);
+
+  uc* mainPixels = gdk_pixbuf_get_pixels(apply);
+  if (width != gdk_pixbuf_get_width(quickSelectBitMap) || height != gdk_pixbuf_get_height(quickSelectBitMap)) { //If the width and height of the apply pixbuf don't match the quickSelectBitMap then we need to resize it
+    GdkPixbuf *temp = quickSelectBitMap;
+    quickSelectBitMap = gdk_pixbuf_scale_simple(quickSelectBitMap, width, height, GDK_INTERP_BILINEAR);
+    g_object_unref(temp);
+  }
+  //quickSelectBitMap and apply should have the same width and height here
+  uc* bitPixels = gdk_pixbuf_get_pixels(quickSelectBitMap);
+  int rowstride = gdk_pixbuf_get_rowstride(apply), channels = gdk_pixbuf_get_n_channels(apply);
+
+  //Make a new res pixbuf to return
+  GdkPixbuf *res = gdk_pixbuf_new(GDK_COLORSPACE_RGB, (channels == 4 ? TRUE : FALSE), 8, width, height);
+  uc* resPixels = gdk_pixbuf_get_pixels(res);
+
+  //If quickSelectBitMap has a pixel that's not black, color it in. Otherwise use the pixel from the apply pixbuf.
+  for (int i = 0; i < height; i++) {
+    for (int j = 0; j < width; j++) {
+      int offset = i*rowstride + j*channels;
+      if (bitPixels[offset] != 0) 
+        editPixel(resPixels, bitPixels, offset, offset, channels);
+      else
+        editPixel(resPixels, mainPixels, offset, offset, channels);
+    }
+  }
+  
+  return res;
+} //FUNCTION END
+
+
+void cropImage(GtkWidget *widget, gpointer data) { 
+    if (originalImagePix == NULL || (currentImageHeight < scrollHeight || currentImageWidth < scrollWidth) || quickSelectionOn) return;
     
     GtkWidget *scroll = GTK_WIDGET(data);
     GtkAdjustment *hAdj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(scroll)), *vAdj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroll));
@@ -385,6 +533,108 @@ void cropImage(GtkWidget *widget, gpointer data) {
 
 void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog that contains all image modifying functions 
   if (originalImagePix == NULL) return;
+
+  if (quickSelectionOn) {  //This will setup the quickSelectBitMap for coloring
+    uc* pixels = gdk_pixbuf_get_pixels(quickSelectBitMap);
+    int width = gdk_pixbuf_get_width(quickSelectBitMap), height = gdk_pixbuf_get_height(quickSelectBitMap);
+    int rowstride = gdk_pixbuf_get_rowstride(quickSelectBitMap), channels = gdk_pixbuf_get_n_channels(quickSelectBitMap);
+
+    uc **colorMap = malloc(height*sizeof(uc*));
+    for (int i = 0; i < height; i++) {
+        colorMap[i] = malloc(width*sizeof(uc));
+        for (int j = 0; j < width; j++) colorMap[i][j] = 0;
+    }
+
+    /*  -----------------------------------LOGIC---------------------------------------------
+     *  We will always have a bounded area, so the idea was whenever we encounter a 
+     *  white pixel that we will start drawing and when we encounter another white pixel it we will stop
+     * 
+     *  Bugs occured using this approach, so this is the consensus. We will use the same exact logic
+     *  and read in all directions (up,right,down,left), if one of these directions agrees that we must color a slot
+     *  it will add one to the colorMap. If 3 or more directions agree we should color then we should in fact color.
+     * 
+     *  So once we finished the colorMap we read all elements and search for ones that have a value of 3 or more. 
+     *  These elements will be placed in their respective spots in the quickSelectBitMap.
+     *  Then the quickSelectBitMap will be resized so it can interact with the originalImagePix.
+     *  We will quit quick selection once the user closes the dialog to avoid bugs.
+     *  
+     *  Bascially it's a bunch of linear searches that reach a consensus.
+     *  This is what I came up with after going insane for a bit, legit running on pure hope lmao.
+     */
+
+    uc* colorPixels = malloc(4*sizeof(uc));
+    for (int i = 0; i < 4; i++) colorPixels[i] = quickSelectionColor;
+    bool setColorNow = false, colorNow = false;
+
+    //Right Search
+    for (int i = 0; i < height; i++) {
+      setColorNow = false, colorNow = false;
+      for (int j = 0; j < width; j++) {
+        int offset = i*rowstride + j*channels;
+        if (pixels[offset] != 0) setColorNow = true;
+        if (pixels[offset] == 0 && setColorNow) {
+          colorNow = !colorNow;
+          setColorNow = false;
+        }
+        if (colorNow) colorMap[i][j] += 1;
+      }
+    }
+
+    //Left Search
+    for (int i = 0; i < height; i++) {
+      setColorNow = false, colorNow = false;
+      for (int j = width-1; j >= 0; j--) {
+        int offset = i*rowstride + j*channels;
+        if (pixels[offset] != 0) setColorNow = true;
+        if (pixels[offset] == 0 && setColorNow) {
+          colorNow = !colorNow;
+          setColorNow = false;
+        }
+        if (colorNow) colorMap[i][j] += 1;
+      }
+    }
+  
+    //Down search
+    for (int i = 0; i < width; i++) {
+      setColorNow = false, colorNow = false;
+      for (int j = 0; j < height; j++) {
+        int offset = j*rowstride + i*channels;
+        if (pixels[offset] != 0) setColorNow = true;
+        if (pixels[offset] == 0 && setColorNow) {
+          colorNow = !colorNow;
+          setColorNow = false;
+        }
+        if (colorNow) colorMap[j][i] += 1;
+      }
+    }
+
+    //Up search
+    for (int i = 0; i < width; i++) {
+      setColorNow = false, colorNow = false;
+      for (int j = height-1; j >= 0; j--) {
+        int offset = j*rowstride + i*channels;
+        if (pixels[offset] != 0) setColorNow = true;
+        if (pixels[offset] == 0 && setColorNow) {
+          colorNow = !colorNow;
+          setColorNow = false;
+        }
+        if (colorNow) colorMap[j][i] += 1;
+      }
+    }
+
+    //Edit pixels of quickSelectionBitMap
+    for (int i = 0; i < height; i++) {
+      for (int j = 0; j < width; j++) {
+        int offset = i*rowstride + j*channels;
+        if (colorMap[i][j] > 2) editPixel(pixels, colorPixels, offset, 0, channels);
+      }
+    }
+
+    for (int i = 0; i < height; i++) free(colorMap[i]);
+    free(colorMap);
+    //Please don't ask lmao ;-; (applyBitmap also resizes the bitmap as needed so basically I'm just being lazy here)
+    g_object_unref(applyBitmap(originalImagePix));
+  }
 
   GtkWidget *dialog = gtk_dialog_new();
   gtk_widget_set_size_request(dialog, 500, 500);
@@ -438,6 +688,12 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   gtk_dialog_run(GTK_DIALOG(dialog));
 
   gtk_widget_destroy(dialog);
+
+  if (quickSelectionOn) {
+    GdkEventKey event;
+    event.keyval = GDK_KEY_Escape;
+    keyPress(widget, &event, NULL);
+  }
 } //FUNCTION END
 
 /*
@@ -469,6 +725,9 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
 
     currentPix = gdk_pixbuf_copy(originalImagePix);
     uc *pixels = gdk_pixbuf_get_pixels(currentPix); //Take pixels from the currentPix
+
+    uc* quickSelectPixels;
+    if (quickSelectionOn) quickSelectPixels = gdk_pixbuf_get_pixels(quickSelectBitMap);
     /*
       Get the size of each row and the amount of channels in the image
       If an image only give you rgb that means it has 3 channels such as in a jpg, if it gives you rgba like in a png that means it has 4 channels.
@@ -491,7 +750,11 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
            break;
            case 4: newPixel=args->operation(rgb, factor, j, i);
         }
-        editPixel(pixels, newPixel, offset, 0, 3); //Edit pixel
+        if (quickSelectionOn) {
+            if (quickSelectPixels[offset] != 0) editPixel(pixels, newPixel, offset, 0, 3);
+        } else { 
+          editPixel(pixels, newPixel, offset, 0, 3); //Edit pixel
+        }
         free(rgb);
         free(newPixel);
       }
@@ -499,7 +762,7 @@ void editAllPixels(GtkWidget *widget, gpointer data) { //Used to apply an algori
     g_object_unref(originalImagePix);
     originalImagePix = gdk_pixbuf_copy(currentPix);
     g_object_unref(currentPix);
-    resizeImage(widget, NULL);
+    reDrawImage();
     trackModification();
 } //FUNCTION END
 
@@ -533,7 +796,7 @@ uc* lightenPixel(uc* rgb, int factor) { //Lighten a pixel
   pixel[2] = (int)(pow(rgb[2]/255.0, 1/(double)factor)*255);
   return pixel;
 } //FUNCTION END
-uc* swirlImage(uc* rgb, int factor, int x, int y) {
+uc* swirlImage(uc* rgb, int factor, int x, int y) { //Swirl the image
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
   double dx = x - width/2.0; //Distance away from middle on the x
   double dy = y - height/2.0; //Distance away from middle on the y
@@ -552,10 +815,12 @@ uc* swirlImage(uc* rgb, int factor, int x, int y) {
     editPixel(pixel, rgb, 0, 0, 3);
   }
   return pixel;
-} 
+} //FUNCTION END
 
 
 void flip(GtkWidget *widget, gpointer data) { //Flip the image
+  if (quickSelectionOn) return;
+
   uc *pixels = gdk_pixbuf_get_pixels(originalImagePix);
   int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
@@ -584,11 +849,13 @@ void flip(GtkWidget *widget, gpointer data) { //Flip the image
   originalImagePix = gdk_pixbuf_copy(currentPix);
   g_object_unref(currentPix);
   resizeImage(widget, NULL);
-   trackModification();
+  trackModification();
 } //FUNCTION END
 
 
 void flop(GtkWidget *widget, gpointer data) { //Flop the image
+  if (quickSelectionOn) return;
+
   uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
   int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
@@ -621,6 +888,8 @@ void flop(GtkWidget *widget, gpointer data) { //Flop the image
 
 
 void rotateRight(GtkWidget *widget, gpointer data) { //Rotate an image right
+  if (quickSelectionOn) return;
+
   uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
   int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
@@ -658,6 +927,8 @@ void rotateRight(GtkWidget *widget, gpointer data) { //Rotate an image right
 
 
 void rotateLeft(GtkWidget *widget, gpointer data) { //Rotates an image left
+  if (quickSelectionOn) return;
+
   uc* pixels = gdk_pixbuf_get_pixels(originalImagePix);
   int rowstride = gdk_pixbuf_get_rowstride(originalImagePix), channels = gdk_pixbuf_get_n_channels(originalImagePix);
   int width = gdk_pixbuf_get_width(originalImagePix), height = gdk_pixbuf_get_height(originalImagePix);
@@ -708,6 +979,8 @@ void trackModification() { //Tracks the amount of modifications done to the imag
 } //FUNCTION END
 
 void revertImage(GtkWidget *widget, gpointer data) { //revert image to older version (undo function)
+  if (quickSelectionOn) return;
+
   if (maxRedo == 0) maxRedo = modificationCounter; //Save the max redo
 
   g_object_unref(originalImagePix);
@@ -723,7 +996,9 @@ void revertImage(GtkWidget *widget, gpointer data) { //revert image to older ver
   }
   resizeImage(widget, NULL);
 } //FUNCTION END
-void redoImage(GtkWidget *widget, gpointer data) {
+void redoImage(GtkWidget *widget, gpointer data) { //Brings back reverted image (redo function)
+  if (quickSelectionOn) return;
+
   if (modificationCounter < maxRedo) {
     g_object_unref(originalImagePix);
 
@@ -732,11 +1007,11 @@ void redoImage(GtkWidget *widget, gpointer data) {
     originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
     resizeImage(widget, NULL);
   }
-}
-
-
+} //FUNCTION END
 
 void resizeSpecific(GtkWidget *widget, gpointer data) { //Resizies an image to specific dimensions (Changes original image for saving purposes)
+  if (quickSelectionOn) return;
+
   char *text = (char*)gtk_entry_get_text(GTK_ENTRY(entry));
   if (strchr(text, 'x') == NULL) return;
 
