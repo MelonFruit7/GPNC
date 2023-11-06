@@ -24,9 +24,9 @@ int currentImageWidth, currentImageHeight; //Current image width and height (res
 GtkWidget *image; //The image container
 GtkWidget *keepAspectRatio; //Check Button which maintains aspect ratio if selected
 int scrollWidth = 725, scrollHeight = 725; //The scrolled window widget width and height 
-int zoomLevel = 40; //This is the amount of pixels we zoom in by the y when scrolling (By default)
+int zoomLevel = 30; //This is the amount of pixels we zoom in by the y when scrolling (By default)
 
-int modificationCounter = 0; //Tracks the amount of modifications made to the original image
+int modificationCounter = 0, quickSelectionModCounter = 0; //Tracks the amount of modifications made to the original image
 int maxRedo = 0; //Signifies the max image you can redo to, if it's 0 you are unable to redo
 
 GtkWidget *colorBtn; //Color Button
@@ -79,7 +79,7 @@ void changeZoomLevel(GtkWidget *widget, gpointer data);
 void activate(GtkApplication *app, gpointer data) { //----------------------------------------------------------------------------------------------------------------------------------
   GtkWidget *window = gtk_application_window_new(app);
   gtk_window_set_default_size(GTK_WINDOW(window), scrollWidth, scrollHeight);
-  gtk_container_set_border_width(GTK_CONTAINER(window), 10);
+  gtk_container_set_border_width(GTK_CONTAINER(window), 0);
   gtk_window_set_title(GTK_WINDOW(window), "GPNC (General Purpose Network-graphic Controller)");
 
   //CSS provider (lets us now where the css file is)
@@ -88,7 +88,7 @@ void activate(GtkApplication *app, gpointer data) { //--------------------------
 
 
   //Vertical box to store the image and the nav bar
-  GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+  GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_container_add(GTK_CONTAINER(window), vbox);
   //Horizontal box (nav bar)
   GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
@@ -144,10 +144,6 @@ void activate(GtkApplication *app, gpointer data) { //--------------------------
 
   
   //Define CSS of widgets
-  defineCSS(window, cssProvider, "windowView");
-  defineCSS(scrollBox, cssProvider, "scrollBox");
-  defineCSS(image, cssProvider, "imageView");
-  defineCSS(vbox, cssProvider, "vboxContainer");
   defineCSS(hbox, cssProvider, "hboxTopContainer");
 
   gtk_widget_show_all(window);
@@ -448,16 +444,21 @@ void drawQuickSelect(int x, int y) { //Drawing helper for quick selection (x and
 } //FUNCTION END
 
 void connectPixelQuickSelect(uc *pixels, int x1, int y1, int x2, int y2, int rowstride, int channels, uc* pixelConnect) { //Simple connect pixels
-  //This works for our purposes but if I wanted to make this better I could work with slopes.
-  int xStep = x2-x1>=0 ? 1 : -1;
-  while (x1 != x2) {
-    x1 += xStep;
-    editPixel(pixels, pixelConnect, y1*rowstride + x1*channels, 0, channels);  
-  }
-  int yStep = y2-y1>=0 ? 1 : -1;
-  while (y1 != y2) {
-    y1 += yStep;
-    editPixel(pixels, pixelConnect, y1*rowstride + x1*channels, 0, channels);  
+  double ySlope = x2 != x1 ? fabs((double)(y2-y1)/(x2-x1)) : 1;
+  double xSlope = y2 != y1 ? fabs((double)(x2-x1)/(y2-y1)) : 1;
+  if (xSlope > ySlope)
+    xSlope = 1;
+  else
+    ySlope = 1;
+
+  if (x2-x1 < 0) xSlope = -xSlope;
+  if (y2-y1 < 0) ySlope = -ySlope;
+
+  double x11 = x1, y11 = y1;
+  while ((int)x11 != x2 || (int)y11 != y2) {
+    if ((int)x11 != x2) x11 += xSlope;
+    if ((int)y11 != y2) y11 += ySlope;
+    editPixel(pixels, pixelConnect, ((int)y11)*rowstride + ((int)x11)*channels, 0, channels);
   }
 } //FUNCTION END
 
@@ -535,6 +536,7 @@ void modifyImageDialog(GtkWidget *widget, gpointer data) { //Shows the dialog th
   if (originalImagePix == NULL) return;
 
   if (quickSelectionOn) {  //This will setup the quickSelectBitMap for coloring
+    quickSelectionModCounter = modificationCounter;
     uc* pixels = gdk_pixbuf_get_pixels(quickSelectBitMap);
     int width = gdk_pixbuf_get_width(quickSelectBitMap), height = gdk_pixbuf_get_height(quickSelectBitMap);
     int rowstride = gdk_pixbuf_get_rowstride(quickSelectBitMap), channels = gdk_pixbuf_get_n_channels(quickSelectBitMap);
@@ -979,7 +981,7 @@ void trackModification() { //Tracks the amount of modifications done to the imag
 } //FUNCTION END
 
 void revertImage(GtkWidget *widget, gpointer data) { //revert image to older version (undo function)
-  if (quickSelectionOn) return;
+  if (quickSelectionOn && modificationCounter <= quickSelectionModCounter) return;
 
   if (maxRedo == 0) maxRedo = modificationCounter; //Save the max redo
 
@@ -994,17 +996,17 @@ void revertImage(GtkWidget *widget, gpointer data) { //revert image to older ver
   
     originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
   }
+  if (quickSelectionOn) reDrawImage();
   resizeImage(widget, NULL);
 } //FUNCTION END
 void redoImage(GtkWidget *widget, gpointer data) { //Brings back reverted image (redo function)
-  if (quickSelectionOn) return;
-
   if (modificationCounter < maxRedo) {
     g_object_unref(originalImagePix);
 
     char filePath[30];
     sprintf(filePath, SAVE_CONTENT_PATH, ++modificationCounter);
     originalImagePix = gdk_pixbuf_new_from_file(filePath, NULL);
+    if (quickSelectionOn) reDrawImage();
     resizeImage(widget, NULL);
   }
 } //FUNCTION END
@@ -1029,6 +1031,7 @@ void resizeSpecific(GtkWidget *widget, gpointer data) { //Resizies an image to s
 
   currentImageWidth = width;
   currentImageHeight = height;
+  trackModification();
 } //FUNCTION END
 
 
